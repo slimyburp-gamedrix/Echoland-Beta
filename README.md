@@ -13,6 +13,8 @@ Since I’m still getting familiar with Git, I’ve created a separate repo with
 
 This is a community-driven effort. I started this with the goal of creating an open-source, writable archive. I’m not a trained developer, just someone diving in and learning as I go. The goal is to give the community a solid foundation to build their own servers, fully customizable and free to modify however you like.
 
+It's safe to say that now, Anyland will live on—endlessly, openly, and forever in the hands of its community.
+
 ## Current Features
 
 - Create an area and build things  
@@ -70,11 +72,10 @@ Get started here: [https://www.docker.com/get-started](https://www.docker.com/ge
 
 #### If you have the Steam version:
 ```
-
-yourserverip app.anyland.com
-yourserverip d6ccx151yatz6.cloudfront.net
-yourserverip d26e4xubm8adxu.cloudfront.net
-#yourserverip steamuserimages-a.akamaihd.net
+127.0.0.1 app.anyland.com
+127.0.0.1 d6ccx151yatz6.cloudfront.net
+127.0.0.1 d26e4xubm8adxu.cloudfront.net
+#127.0.0.1 steamuserimages-a.akamaihd.net
 ```
 
 
@@ -83,25 +84,24 @@ Use `127.0.0.1` if the server is on your local machine. Otherwise, use the IP of
 
 #### If you’re using the non-Steam client:
 ```
-
-yourserverip app.anyland.com
-yourserverip d6ccx151yatz6.cloudfront.net
-yourserverip d26e4xubm8adxu.cloudfront.net
-yourserverip steamuserimages-a.akamaihd.net
+127.0.0.1 app.anyland.com
+127.0.0.1 d6ccx151yatz6.cloudfront.net
+127.0.0.1 d26e4xubm8adxu.cloudfront.net
+127.0.0.1 steamuserimages-a.akamaihd.net
 ```
 
 
 Download the client:  
 [Client Release](https://github.com/Echoland-AL/echoland/releases/tag/echoland-client)
 
-Download the images folder:  
-[Images Folder (Google Drive)](https://drive.google.com/file/d/1rSRWNtBepypfqHQ9LRPpDAsouAsByMCl/view?usp=drive_link)
+Download the images folder(If using the non-steam client):  
+[Images Folder (Google Drive)](https://drive.google.com/file/d/1RbCZvx0SJK9oaLEhfDAfSgdZJKgmGxAU/view?usp=drive_link)
 
 Place the images folder inside the main Echoland directory.
 
 ### 3. Download Archive Data
 
-[Archive Data Release](https://github.com/Echoland-AL/echoland/releases/tag/archive-data)
+[Archive Data](https://drive.google.com/file/d/1f-XnM_KmwdqGhp9lpCx1SCiWUdCjhjWw/view?usp=drive_link)
 
 Extract the `data.zip` contents into your Echoland server folder named as "data"
 
