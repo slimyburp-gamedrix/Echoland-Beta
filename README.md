@@ -19,7 +19,7 @@ It's safe to say that now, Anyland will live on—endlessly, openly, and forever
 
 - Create an area and build things  
 - Automatically assigned name and area  
-- Inventory and body attachment systems are not yet implemented
+- Inventory and body attachment work
 - Newly created areas may return as private until you restart the server  
 - Repo posted early due to excitement  
 - Actively in development—and open for community contributions
