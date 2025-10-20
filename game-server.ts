@@ -108,12 +108,26 @@ async function initDefaults() {
     accountData = {
       personId,
       screenName,
-      homeAreaId
+      homeAreaId,
+      attachments: {}
     };
 
     await fs.mkdir("./data/person", { recursive: true });
     await fs.writeFile(accountPath, JSON.stringify(accountData, null, 2));
     console.log(`🧠 Memory card initialized for ${screenName}`);
+  }
+
+  // Ensure required fields exist for existing accounts
+  let needsUpdate = false;
+  if (!accountData.attachments) {
+    accountData.attachments = {};
+    needsUpdate = true;
+  }
+  
+  // Save updated account data if needed
+  if (needsUpdate) {
+    await fs.writeFile(accountPath, JSON.stringify(accountData, null, 2));
+    console.log(`🔄 Updated account data with missing fields`);
   }
 
   // Create person info file
@@ -363,20 +377,9 @@ const app = new Elysia()
     console.info("error in middleware!", request.url, code);
     console.log(error);
   })
-  .onTransform(({ path, body }) => {
-    if (path.includes("placement")) {
-      console.log("Placement route hit:", path, JSON.stringify(body, null, 2));
-    }
-  })
-  .onTransform(({ path, body }) => {
-    if (path.includes("ach") || path.includes("p")) {
-      console.log(`[HEARTBEAT] ${path}:`, JSON.stringify(body));
-    }
-  })
-  .onTransform(({ path, body }) => {
-    if (path.includes("inventory")) {
-      console.log(`[INVENTORY] ${path}:`, JSON.stringify(body));
-    }
+  .onTransform(({ request, path, body, params }) => {
+    // Match Redux server's simple logging
+    console.log(request.method, path, { body, params })
   })
 
 
@@ -390,6 +393,21 @@ const app = new Elysia()
       ast.value = `s:${generateObjectId()}`
       ast.httpOnly = true
 
+      // Extract hands from attachments for separate fields
+      const attachmentsObj = typeof account.attachments === "string" 
+        ? JSON.parse(account.attachments || "{}") 
+        : (account.attachments ?? {});
+      
+      console.log("[AUTH] Current attachments:", Object.keys(attachmentsObj).map(k => `${k}: ${attachmentsObj[k] ? 'has data' : 'empty'}`).join(', '));
+      
+      // Return attachments from account.json
+      const attachmentsString = typeof account.attachments === "string"
+        ? account.attachments
+        : JSON.stringify(account.attachments ?? {});
+      
+      console.log("[AUTH] Attachments:", attachmentsString.substring(0, 200) + "...");
+      
+      // Match Redux server format with proper values
       return {
         vMaj: 188,
         vMinSrv: 1,
@@ -398,28 +416,28 @@ const app = new Elysia()
         screenName: account.screenName,
         statusText: `exploring around (my id: ${account.personId})`,
         isFindable: true,
-        age: 0,
-        ageSecs: 0,
-        attachments: typeof account.attachments === "string"
-          ? account.attachments
-          : JSON.stringify(account.attachments ?? {}),
+        age: account.age || 2226,
+        ageSecs: account.ageSecs || 192371963,
+        attachments: attachmentsString,
         isSoftBanned: false,
         showFlagWarning: false,
         flagTags: [],
-        areaCount: 1,
+        areaCount: account.ownedAreas?.length || 1,
         thingTagCount: 1,
         allThingsClonable: true,
-        achievements: [],
-        isEditorHere: true,
-        isListEditorHere: true,
-        isOwnerHere: true,
+        // Include default achievements like Redux server
+        achievements: account.achievements || [
+          30, 7, 19, 4, 20, 11, 10,
+          5, 9, 17, 13, 12, 16, 37,
+          34, 35, 44, 31, 15, 27, 28
+        ],
         hasEditTools: true,
         hasEditToolsPermanently: true,
-        editToolsExpiryDate: null,
+        editToolsExpiryDate: '2024-01-30T15:26:27.720Z',
         isInEditToolsTrial: false,
-        wasEditToolsTrialEverActivated: false,
-        customSearchWords: ""
-      }
+        wasEditToolsTrialEverActivated: true,
+        customSearchWords: ''
+      };
     },
     {
       cookie: t.Object({
@@ -427,19 +445,32 @@ const app = new Elysia()
       })
     }
   )
-  // Save avatar body attachments to account.json
   .post("/person/updateattachment", async ({ body }) => {
+    console.log("[ATTACHMENT] Received request:", JSON.stringify(body));
     const { id, data, attachments } = body as any;
 
     const accountPath = "./data/person/account.json";
     let accountData: Record<string, any> = {};
-    try {
-      accountData = JSON.parse(await fs.readFile(accountPath, "utf-8"));
-    } catch {
-      return new Response(JSON.stringify({ ok: false, error: "Account not found" }), {
-        status: 404,
-        headers: { "Content-Type": "application/json" }
-      });
+    
+    // Retry logic to handle concurrent writes
+    let retries = 5;
+    while (retries > 0) {
+      try {
+        const fileContent = await fs.readFile(accountPath, "utf-8");
+        accountData = JSON.parse(fileContent);
+        break;
+      } catch (e) {
+        retries--;
+        if (retries === 0) {
+          console.error("[ATTACHMENT] Failed to read account after retries:", e);
+          return new Response(JSON.stringify({ ok: false, error: "Account read failed" }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+        // Wait a bit before retrying
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
     }
 
     // Ensure attachments object exists in account
@@ -462,19 +493,39 @@ const app = new Elysia()
         }
       }
       accountData.attachments = parsed;
+      console.log("[ATTACHMENT] Updated full attachments");
     } else if (id !== undefined && data !== undefined) {
-      // Incremental update path: single slot
-      let parsedData: any = data;
-      if (typeof data === "string") {
-        try { parsedData = JSON.parse(data); } catch {
-          return new Response(JSON.stringify({ ok: false, error: "data must be JSON string" }), {
-            status: 422,
-            headers: { "Content-Type": "application/json" }
-          });
+      // Incremental update path: single slot (including hands which are just numbered slots)
+      const slotId = String(id);
+      
+      // Empty string means remove this attachment
+      if (data === "" || data === null) {
+        delete currentAttachments[slotId];
+        accountData.attachments = currentAttachments;
+        console.log(`[ATTACHMENT] Removed attachment from slot ${slotId}`);
+      } else {
+        // Parse and store the attachment data
+        let parsedData: any = data;
+        if (typeof data === "string") {
+          try { parsedData = JSON.parse(data); } catch {
+            return new Response(JSON.stringify({ ok: false, error: "data must be JSON string" }), {
+              status: 422,
+              headers: { "Content-Type": "application/json" }
+            });
+          }
         }
+        
+        // Wrist attachments (slots 6 and 7) are just regular attachments
+        // The client handles "replaces hand when worn" logic by checking thing definitions
+        if (slotId === "6" || slotId === "7") {
+          console.log(`[WRIST] Storing wrist attachment in slot ${slotId}`);
+        }
+        
+        // Store attachment in the numbered slot
+        currentAttachments[slotId] = parsedData;
+        accountData.attachments = currentAttachments;
+        console.log(`[ATTACHMENT] Updated attachment slot ${slotId}:`, parsedData);
       }
-      currentAttachments[String(id)] = parsedData;
-      accountData.attachments = currentAttachments;
     } else {
       return new Response(JSON.stringify({ ok: false, error: "Missing attachments or (id,data)" }), {
         status: 422,
@@ -482,19 +533,68 @@ const app = new Elysia()
       });
     }
 
-    await fs.writeFile(accountPath, JSON.stringify(accountData, null, 2));
+    // Atomic write with retry
+    let writeRetries = 5;
+    while (writeRetries > 0) {
+      try {
+        const tempPath = `${accountPath}.tmp`;
+        await fs.writeFile(tempPath, JSON.stringify(accountData, null, 2));
+        await fs.rename(tempPath, accountPath);
+        break;
+      } catch (e) {
+        writeRetries--;
+        if (writeRetries === 0) {
+          console.error("[ATTACHMENT] Failed to write account after retries:", e);
+          return new Response(JSON.stringify({ ok: false, error: "Account write failed" }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+    }
 
     return new Response(JSON.stringify({ ok: true }), {
       status: 200,
       headers: { "Content-Type": "application/json" }
     });
-  }, {
-    body: t.Union([
-      t.Object({
-        attachments: t.Union([t.String(), t.Record(t.String(), t.Any())])
-      }),
-      t.Object({ id: t.Union([t.String(), t.Number()]), data: t.String() })
-    ])
+  })
+  // Set hand color for avatar
+  .post("/person/sethandcolor", async ({ body }) => {
+    console.log("[HAND COLOR] Received request:", body);
+    
+    const accountPath = "./data/person/account.json";
+    let accountData: Record<string, any> = {};
+    try {
+      accountData = JSON.parse(await fs.readFile(accountPath, "utf-8"));
+    } catch (e) {
+      console.error("[HAND COLOR] Failed to read account:", e);
+      return new Response(JSON.stringify({ ok: false, error: "Account not found" }), {
+        status: 404,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    // Store the hand color data
+    const { r, g, b } = body as any;
+    if (r !== undefined && g !== undefined && b !== undefined) {
+      // Convert to numbers to ensure proper data type
+      accountData.handColor = { 
+        r: parseFloat(r), 
+        g: parseFloat(g), 
+        b: parseFloat(b) 
+      };
+      console.log("[HAND COLOR] Saved hand color:", accountData.handColor);
+    } else {
+      console.warn("[HAND COLOR] Missing r, g, b values:", body);
+    }
+
+    await fs.writeFile(accountPath, JSON.stringify(accountData, null, 2));
+    
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
   })
   .post("/p", () => ({ "vMaj": 188, "vMinSrv": 1 }))
   .post(
@@ -1634,7 +1734,9 @@ const app = new Elysia()
   .post("/thing", async ({ body }) => {
     const { name = "" } = body;
     const thingId = generateObjectId();
-    const filePath = `./data/thing/info/${thingId}.json`;
+    const infoPath = `./data/thing/info/${thingId}.json`;
+    const defPath = `./data/thing/def/${thingId}.json`;
+    const tagsPath = `./data/thing/tags/${thingId}.json`;
 
     // ✅ Load identity from account.json
     let creatorId = "unknown";
@@ -1647,8 +1749,8 @@ const app = new Elysia()
       console.warn("⚠️ Could not load account.json for object metadata.", e);
     }
 
-    // ✅ Build object with correct identity
-    const thingData = {
+    // ✅ Build thinginfo object
+    const thingInfo = {
       id: thingId,
       name,
       creatorId,
@@ -1660,13 +1762,164 @@ const app = new Elysia()
       isUnlisted: false
     };
 
-    await fs.mkdir(path.dirname(filePath), { recursive: true });
-    await fs.writeFile(filePath, JSON.stringify(thingData, null, 2));
+    // ✅ Build thingdef object (3D object data)
+    const thingDef = {
+      name,
+      // Empty 3D object data - will be populated when user builds the object
+      // This matches the structure from the example def file
+    };
+
+    // ✅ Build thingtags object
+    const thingTags = {
+      tags: []
+    };
+
+    // Create directories and save all three files
+    await fs.mkdir(path.dirname(infoPath), { recursive: true });
+    await fs.mkdir(path.dirname(defPath), { recursive: true });
+    await fs.mkdir(path.dirname(tagsPath), { recursive: true });
+    
+    await fs.writeFile(infoPath, JSON.stringify(thingInfo, null, 2));
+    await fs.writeFile(defPath, JSON.stringify(thingDef, null, 2));
+    await fs.writeFile(tagsPath, JSON.stringify(thingTags, null, 2));
+
+    console.log(`✅ Created thing ${thingId} with info, def, and tags files`);
+
+    // Update topby list for the creator
+    try {
+      const topbyDir = "./data/person/topby";
+      await fs.mkdir(topbyDir, { recursive: true });
+      const topbyPath = `${topbyDir}/${creatorId}.json`;
+      
+      let topbyData: { ids: string[] } = { ids: [] };
+      try {
+        const existing = await fs.readFile(topbyPath, "utf-8");
+        topbyData = JSON.parse(existing);
+      } catch {
+        // File doesn't exist yet, use default
+      }
+      
+      // Add new thing to the front of the list
+      topbyData.ids = [thingId, ...(topbyData.ids || []).filter((id: string) => id !== thingId)].slice(0, 20);
+      await fs.writeFile(topbyPath, JSON.stringify(topbyData, null, 2));
+    } catch (e) {
+      console.warn("⚠️ Could not update topby list:", e);
+    }
 
     return new Response(JSON.stringify({ id: thingId }), {
       status: 200,
       headers: { "Content-Type": "application/json" }
     });
+  })
+  // ✅ HAND REPLACEMENT SUPPORT
+  // Thing definitions can include attribute flag 22 to enable "replaces hand when worn"
+  // Example: { "n": "My Hand", "a": [22], "p": [...geometry data...] }
+  // When a thing with attribute 22 is attached to wrist slots (6 or 7),
+  // the client automatically renders it as a hand replacement
+  .post("/thing/updateDefinition", async ({ body }) => {
+    const { thingId, id, definition, data } = body;
+    const actualThingId = thingId || id;
+    const actualDefinition = definition || data;
+
+    if (!actualThingId || !actualDefinition) {
+      return new Response(JSON.stringify({ ok: false, error: "Missing thingId or definition" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    const defPath = `./data/thing/def/${actualThingId}.json`;
+    
+    try {
+      // Parse the definition if it's a string
+      const defData = typeof actualDefinition === "string" ? JSON.parse(actualDefinition) : actualDefinition;
+      
+      // Save the complete definition
+      await fs.writeFile(defPath, JSON.stringify(defData, null, 2));
+      
+      console.log(`✅ Updated thing definition for ${actualThingId}${defData.a ? ` with attributes: ${JSON.stringify(defData.a)}` : ''}`);
+
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    } catch (e) {
+      console.error(`❌ Failed to update thing definition for ${actualThingId}:`, e);
+      return new Response(JSON.stringify({ ok: false, error: String(e) }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+  }, {
+    body: t.Any() // Accept any shape since client may send different formats
+  })
+  // Alternative endpoint names for compatibility
+  .post("/thing/saveDefinition", async ({ body }) => {
+    // Redirect to updateDefinition
+    const { thingId, id, definition, data } = body;
+    const actualThingId = thingId || id;
+    const actualDefinition = definition || data;
+
+    if (!actualThingId || !actualDefinition) {
+      return new Response(JSON.stringify({ ok: false, error: "Missing thingId or definition" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    const defPath = `./data/thing/def/${actualThingId}.json`;
+    
+    try {
+      const defData = typeof actualDefinition === "string" ? JSON.parse(actualDefinition) : actualDefinition;
+      await fs.writeFile(defPath, JSON.stringify(defData, null, 2));
+      console.log(`✅ Saved thing definition for ${actualThingId}${defData.a ? ` with attributes: ${JSON.stringify(defData.a)}` : ''}`);
+
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    } catch (e) {
+      console.error(`❌ Failed to save thing definition for ${actualThingId}:`, e);
+      return new Response(JSON.stringify({ ok: false, error: String(e) }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+  }, {
+    body: t.Any()
+  })
+  .put("/thing/:id", async ({ body, params }) => {
+    // Alternative PUT endpoint
+    const thingId = params.id;
+    const actualDefinition = body.definition || body.data || body;
+
+    if (!thingId || !actualDefinition) {
+      return new Response(JSON.stringify({ ok: false, error: "Missing data" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    const defPath = `./data/thing/def/${thingId}.json`;
+    
+    try {
+      const defData = typeof actualDefinition === "string" ? JSON.parse(actualDefinition) : actualDefinition;
+      await fs.writeFile(defPath, JSON.stringify(defData, null, 2));
+      console.log(`✅ PUT thing definition for ${thingId}${defData.a ? ` with attributes: ${JSON.stringify(defData.a)}` : ''}`);
+
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    } catch (e) {
+      console.error(`❌ Failed to PUT thing definition for ${thingId}:`, e);
+      return new Response(JSON.stringify({ ok: false, error: String(e) }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+  }, {
+    body: t.Any()
   })
   .post("/thing/rename", async ({ body }) => {
     const { thingId, newName } = body;
@@ -1992,6 +2245,25 @@ const app = new Elysia()
       updates: t.Record(t.String(), t.Any())
     })
   })
+  .post("/thing/topby", async () => {
+    // Return top things created by the current user
+    const account = JSON.parse(await fs.readFile("./data/person/account.json", "utf-8"));
+    const personId = account.personId;
+    const file = Bun.file(`./data/person/topby/${personId}.json`);
+
+    if (await file.exists()) {
+      const data = await file.json();
+      return new Response(JSON.stringify({ ids: data.ids.slice(0, 4) }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    } else {
+      return new Response(JSON.stringify({ ids: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+  })
   .post("/thing/topCreatedByPerson", async ({ body: { id } }) => {
     const file = Bun.file(`./data/person/topby/${id}.json`);
 
@@ -2145,6 +2417,8 @@ console.log(`🦊 AreaBundles server is running at on port ${app_areaBundles.ser
 
 const app_thingDefs = new Elysia()
   .onRequest(({ request }) => {
+    const url = new URL(request.url);
+    console.log(`[THINGDEFS] 📥 Requested: ${url.pathname}`);
     console.info(JSON.stringify({
       server: "THINGDEFS",
       ts: new Date().toISOString(),
@@ -2160,18 +2434,21 @@ const app_thingDefs = new Elysia()
   .get(
     "/:thingId",
     async ({ params: { thingId } }) => {
+      console.log(`[THINGDEFS] 🔍 Looking for: ${thingId}`);
       const file = Bun.file(path.resolve("./data/thing/def/", thingId + ".json"));
       if (await file.exists()) {
         try {
-          return await file.json();
-
+          const def = await file.json();
+          console.log(`[THINGDEFS] ✅ Served ${thingId} (has attributes: ${def.a || 'none'})`);
+          return def;
         }
         catch (e) {
+          console.error(`[THINGDEFS] ❌ JSON parse error for ${thingId}:`, e);
           return Response.json("", { status: 200 })
         }
       }
       else {
-        console.error("client asked for a thingdef not on disk!!", thingId)
+        console.error(`[THINGDEFS] ❌ NOT FOUND: ${thingId}`)
         //return new Response("Thingdef not found", { status: 404 })
         return Response.json("", { status: 200 })
       }
