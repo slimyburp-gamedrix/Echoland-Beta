@@ -3,6 +3,32 @@ import { Elysia, t } from 'elysia'
 import * as fs from "node:fs/promises";
 import { AreaInfoSchema } from "./lib/schemas";
 
+// Simple mutex for preventing concurrent account.json modifications
+class AsyncMutex {
+  private mutex = Promise.resolve();
+
+  lock(): Promise<() => void> {
+    let release: () => void;
+    const acquire = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const prevMutex = this.mutex;
+    this.mutex = prevMutex.then(() => acquire);
+    return prevMutex.then(() => release!);
+  }
+
+  async runExclusive<T>(callback: () => Promise<T>): Promise<T> {
+    const release = await this.lock();
+    try {
+      return await callback();
+    } finally {
+      release();
+    }
+  }
+}
+
+const accountMutex = new AsyncMutex();
+
 const HOST = Bun.env.HOST ?? "0.0.0.0";
 const PORT_API = Number(Bun.env.PORT_API ?? 8000);
 const PORT_CDN_THINGDEFS = Number(Bun.env.PORT_CDN_THINGDEFS ?? 8001);
@@ -407,8 +433,8 @@ const app = new Elysia()
       
       console.log("[AUTH] Attachments:", attachmentsString.substring(0, 200) + "...");
       
-      // Match Redux server format with proper values
-      return {
+      // Build response object
+      const authResponse: any = {
         vMaj: 188,
         vMinSrv: 1,
         personId: account.personId,
@@ -438,6 +464,14 @@ const app = new Elysia()
         wasEditToolsTrialEverActivated: true,
         customSearchWords: ''
       };
+      
+      // Include saved hand color if it exists (for persistence across sessions)
+      if (account.handColor) {
+        authResponse.handColor = account.handColor;
+        console.log("[AUTH] Returning saved hand color:", account.handColor);
+      }
+      
+      return authResponse;
     },
     {
       cookie: t.Object({
@@ -446,65 +480,57 @@ const app = new Elysia()
     }
   )
   .post("/person/updateattachment", async ({ body }) => {
-    console.log("[ATTACHMENT] Received request:", JSON.stringify(body));
-    const { id, data, attachments } = body as any;
+    return await accountMutex.runExclusive(async () => {
+      console.log("[ATTACHMENT] Received request:", JSON.stringify(body));
+      const { id, data, attachments } = body as any;
 
-    const accountPath = "./data/person/account.json";
-    let accountData: Record<string, any> = {};
-    
-    // Retry logic to handle concurrent writes
-    let retries = 5;
-    while (retries > 0) {
+      const accountPath = "./data/person/account.json";
+      let accountData: Record<string, any> = {};
+      
+      // Read account data
       try {
         const fileContent = await fs.readFile(accountPath, "utf-8");
         accountData = JSON.parse(fileContent);
-        break;
       } catch (e) {
-        retries--;
-        if (retries === 0) {
-          console.error("[ATTACHMENT] Failed to read account after retries:", e);
-          return new Response(JSON.stringify({ ok: false, error: "Account read failed" }), {
-            status: 500,
-            headers: { "Content-Type": "application/json" }
-          });
-        }
-        // Wait a bit before retrying
-        await new Promise(resolve => setTimeout(resolve, 50));
+        console.error("[ATTACHMENT] Failed to read account:", e);
+        return new Response(JSON.stringify({ ok: false, error: "Account read failed" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" }
+        });
       }
-    }
 
-    // Ensure attachments object exists in account
-    let currentAttachments: Record<string, any> = {};
-    if (typeof accountData.attachments === "string") {
-      try { currentAttachments = JSON.parse(accountData.attachments) ?? {}; } catch { currentAttachments = {}; }
-    } else if (accountData.attachments && typeof accountData.attachments === "object") {
-      currentAttachments = accountData.attachments as Record<string, any>;
-    }
-
-    if (attachments !== undefined) {
-      // Full replacement path
-      let parsed: unknown = attachments;
-      if (typeof attachments === "string") {
-        try { parsed = JSON.parse(attachments); } catch {
-          return new Response(JSON.stringify({ ok: false, error: "attachments must be JSON or JSON string" }), {
-            status: 422,
-            headers: { "Content-Type": "application/json" }
-          });
-        }
+      // Ensure attachments object exists in account
+      let currentAttachments: Record<string, any> = {};
+      if (typeof accountData.attachments === "string") {
+        try { currentAttachments = JSON.parse(accountData.attachments) ?? {}; } catch { currentAttachments = {}; }
+      } else if (accountData.attachments && typeof accountData.attachments === "object") {
+        currentAttachments = accountData.attachments as Record<string, any>;
       }
-      accountData.attachments = parsed;
-      console.log("[ATTACHMENT] Updated full attachments");
-    } else if (id !== undefined && data !== undefined) {
-      // Incremental update path: single slot (including hands which are just numbered slots)
-      const slotId = String(id);
-      
-      // Empty string means remove this attachment
-      if (data === "" || data === null) {
-        delete currentAttachments[slotId];
-        accountData.attachments = currentAttachments;
-        console.log(`[ATTACHMENT] Removed attachment from slot ${slotId}`);
-      } else {
-        // Parse and store the attachment data
+
+      if (attachments !== undefined) {
+        // Full replacement path
+        let parsed: unknown = attachments;
+        if (typeof attachments === "string") {
+          try { parsed = JSON.parse(attachments); } catch {
+            return new Response(JSON.stringify({ ok: false, error: "attachments must be JSON or JSON string" }), {
+              status: 422,
+              headers: { "Content-Type": "application/json" }
+            });
+          }
+        }
+        accountData.attachments = parsed;
+        console.log("[ATTACHMENT] Updated full attachments");
+      } else if (id !== undefined && data !== undefined) {
+        // Incremental update path: single slot (including hands which are just numbered slots)
+        const slotId = String(id);
+        
+        // Empty string means remove this attachment
+        if (data === "" || data === null) {
+          delete currentAttachments[slotId];
+          accountData.attachments = currentAttachments;
+          console.log(`[ATTACHMENT] Removed attachment from slot ${slotId}`);
+        } else {
+          // Parse and store the attachment data
         let parsedData: any = data;
         if (typeof data === "string") {
           try { parsedData = JSON.parse(data); } catch {
@@ -515,54 +541,47 @@ const app = new Elysia()
           }
         }
         
-        // Wrist attachments (slots 6 and 7) are just regular attachments
-        // The client handles "replaces hand when worn" logic by checking thing definitions
-        if (slotId === "6" || slotId === "7") {
-          console.log(`[WRIST] Storing wrist attachment in slot ${slotId}`);
+          // Wrist attachments (slots 6 and 7) are just regular attachments
+          // The client handles "replaces hand when worn" logic by checking thing definitions
+          if (slotId === "6" || slotId === "7") {
+            console.log(`[WRIST] Storing wrist attachment in slot ${slotId}`);
+          }
+          
+          // Store attachment in the numbered slot
+          currentAttachments[slotId] = parsedData;
+          accountData.attachments = currentAttachments;
+          console.log(`[ATTACHMENT] Updated attachment slot ${slotId}:`, parsedData);
         }
-        
-        // Store attachment in the numbered slot
-        currentAttachments[slotId] = parsedData;
-        accountData.attachments = currentAttachments;
-        console.log(`[ATTACHMENT] Updated attachment slot ${slotId}:`, parsedData);
+      } else {
+        return new Response(JSON.stringify({ ok: false, error: "Missing attachments or (id,data)" }), {
+          status: 422,
+          headers: { "Content-Type": "application/json" }
+        });
       }
-    } else {
-      return new Response(JSON.stringify({ ok: false, error: "Missing attachments or (id,data)" }), {
-        status: 422,
-        headers: { "Content-Type": "application/json" }
-      });
-    }
 
-    // Atomic write with retry
-    let writeRetries = 5;
-    while (writeRetries > 0) {
+      // Atomic write
       try {
         const tempPath = `${accountPath}.tmp`;
         await fs.writeFile(tempPath, JSON.stringify(accountData, null, 2));
         await fs.rename(tempPath, accountPath);
-        break;
       } catch (e) {
-        writeRetries--;
-        if (writeRetries === 0) {
-          console.error("[ATTACHMENT] Failed to write account after retries:", e);
-          return new Response(JSON.stringify({ ok: false, error: "Account write failed" }), {
-            status: 500,
-            headers: { "Content-Type": "application/json" }
-          });
-        }
-        await new Promise(resolve => setTimeout(resolve, 50));
+        console.error("[ATTACHMENT] Failed to write account:", e);
+        return new Response(JSON.stringify({ ok: false, error: "Account write failed" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" }
+        });
       }
-    }
 
-    return new Response(JSON.stringify({ ok: true }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" }
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
     });
   })
   // Set hand color for avatar
   .post("/person/sethandcolor", async ({ body }) => {
     console.log("[HAND COLOR] Received request:", body);
-    
+
     const accountPath = "./data/person/account.json";
     let accountData: Record<string, any> = {};
     try {
@@ -590,7 +609,7 @@ const app = new Elysia()
     }
 
     await fs.writeFile(accountPath, JSON.stringify(accountData, null, 2));
-    
+
     return new Response(JSON.stringify({ ok: true }), {
       status: 200,
       headers: { "Content-Type": "application/json" }
@@ -1330,6 +1349,111 @@ const app = new Elysia()
     body: t.Object({
       areaId: t.String(),
       placements: t.Array(t.String())
+    })
+  })
+  .post("/placement/setattr", async ({ body }) => {
+    const { areaId, placementId, attribute } = body;
+    
+    if (!areaId || !placementId || attribute === undefined) {
+      return new Response(JSON.stringify({ ok: false, error: "Missing required fields" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    const placementPath = `./data/placement/info/${areaId}/${placementId}.json`;
+    const areaFilePath = `./data/area/load/${areaId}.json`;
+    
+    try {
+      let placementData: any = null;
+      
+      // Try to read the individual placement file first
+      try {
+        placementData = JSON.parse(await fs.readFile(placementPath, "utf-8"));
+        console.log("[SETATTR] Found placement file for", placementId);
+      } catch (e) {
+        // If placement file doesn't exist, try to get it from area load file
+        console.log("[SETATTR] Placement file not found, reading from area load file");
+        try {
+          const areaData = JSON.parse(await fs.readFile(areaFilePath, "utf-8"));
+          if (Array.isArray(areaData.placements)) {
+            placementData = areaData.placements.find((p: any) => p.Id === placementId);
+            if (!placementData) {
+              throw new Error("Placement not found in area file");
+            }
+            console.log("[SETATTR] Found placement in area load file");
+          }
+        } catch (areaError) {
+          console.error("[SETATTR] Failed to read from area file:", areaError);
+          throw new Error("Placement not found");
+        }
+      }
+      
+      // Update the attributes array
+      if (!Array.isArray(placementData.A)) {
+        placementData.A = [];
+      }
+      
+      // Parse attribute as integer
+      const attrValue = parseInt(attribute);
+      
+      // Check if attribute already exists
+      const attrIndex = placementData.A.indexOf(attrValue);
+      
+      if (attrIndex === -1) {
+        // Add the attribute if it doesn't exist
+        placementData.A.push(attrValue);
+        console.log("[SETATTR] Added attribute", attrValue, "to placement", placementId);
+      } else {
+        // Remove the attribute if it exists (toggle behavior)
+        placementData.A.splice(attrIndex, 1);
+        console.log("[SETATTR] Removed attribute", attrValue, "from placement", placementId);
+      }
+      
+      // Try to write the updated placement file
+      try {
+        // Ensure the directory exists
+        const placementDir = `./data/placement/info/${areaId}`;
+        await fs.mkdir(placementDir, { recursive: true });
+        await fs.writeFile(placementPath, JSON.stringify(placementData, null, 2));
+        console.log("[SETATTR] Updated placement file");
+      } catch (e) {
+        console.log("[SETATTR] Could not write placement file (may be read-only):", e);
+      }
+      
+      // Always update the area load file
+      try {
+        const areaData = JSON.parse(await fs.readFile(areaFilePath, "utf-8"));
+        
+        if (Array.isArray(areaData.placements)) {
+          const placementIndex = areaData.placements.findIndex((p: any) => p.Id === placementId);
+          if (placementIndex !== -1) {
+            areaData.placements[placementIndex].A = placementData.A;
+            await fs.writeFile(areaFilePath, JSON.stringify(areaData, null, 2));
+            console.log("[SETATTR] Updated area load file");
+          }
+        }
+      } catch (e) {
+        console.error("[SETATTR] Failed to update area file:", e);
+        throw e;
+      }
+      
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    } catch (error) {
+      console.error("[SETATTR] Error:", error);
+      return new Response(JSON.stringify({ ok: false, error: "Failed to update placement" }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+  }, {
+    body: t.Object({
+      areaId: t.String(),
+      placementId: t.String(),
+      attribute: t.String()
     })
   })
   .post("person/info",
